@@ -51,6 +51,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.curator.utils.PathUtils;
 
@@ -74,6 +75,7 @@ public class LeaderLatch implements Closeable
     private final ListenerContainer<LeaderLatchListener> listeners = new ListenerContainer<LeaderLatchListener>();
     private final CloseMode closeMode;
     private final AtomicReference<Future<?>> startTask = new AtomicReference<Future<?>>();
+    private final AtomicInteger checkLeadershipIteration = new AtomicInteger();
 
     private final ConnectionStateListener listener = new ConnectionStateListener()
     {
@@ -529,6 +531,11 @@ public class LeaderLatch implements Closeable
         final String localOurPath = ourPath.get();
         List<String> sortedChildren = LockInternals.getSortedChildren(LOCK_NAME, sorter, children);
         int ourIndex = (localOurPath != null) ? sortedChildren.indexOf(ZKPaths.getNodeFromPath(localOurPath)) : -1;
+        /* In the event of connection suspend and reconnect, checkLeadership will be called again while previous watches
+         * callbacks are still pending. By incrementing checkLeadershipIteration, we prevent those callbacks from having
+         * any effect. */
+        final int ourIteration = checkLeadershipIteration.incrementAndGet();
+
         if ( ourIndex < 0 )
         {
             log.error("Can't find our node. Resetting. Index: " + ourIndex);
@@ -546,7 +553,7 @@ public class LeaderLatch implements Closeable
                 @Override
                 public void process(WatchedEvent event)
                 {
-                    if ( (state.get() == State.STARTED) && (event.getType() == Event.EventType.NodeDeleted) && (localOurPath != null) )
+                    if ( (checkLeadershipIteration.get() == ourIteration) && (state.get() == State.STARTED) && (event.getType() == Event.EventType.NodeDeleted) && (localOurPath != null) )
                     {
                         try
                         {
@@ -566,7 +573,7 @@ public class LeaderLatch implements Closeable
                 @Override
                 public void processResult(CuratorFramework client, CuratorEvent event) throws Exception
                 {
-                    if ( event.getResultCode() == KeeperException.Code.NONODE.intValue() )
+                    if ((checkLeadershipIteration.get() == ourIteration) && ( event.getResultCode() == KeeperException.Code.NONODE.intValue() ))
                     {
                         // previous node is gone - reset
                         reset();
